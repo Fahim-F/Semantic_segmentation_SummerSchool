@@ -1,5 +1,5 @@
 # Semantic_Segmentation_SummerSchool
-Simple fully convolutional network on CamVid dataset.
+Simple Fully Convolutional Neural Network (FCN)
 
 Colab link https://colab.research.google.com/drive/1AeL7FmK6j0RLNP_fSr4yh_DTjDi-1lcx
 
