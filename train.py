@@ -1,7 +1,6 @@
-# -*- coding: utf-8 -*-
-
 from __future__ import print_function
-
+import warnings
+warnings.filterwarnings("ignore")
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,7 +9,6 @@ from torch.autograd import Variable
 from torch.utils.data import DataLoader
 
 from fcn import VGGNet, FCN32s, FCN16s, FCN8s, FCNs
-from Cityscapes_loader import CityscapesDataset
 from CamVid_loader import CamVidDataset
 
 from matplotlib import pyplot as plt
@@ -18,12 +16,10 @@ import numpy as np
 import time
 import sys
 import os
+n_class    = 32
 
-
-n_class    = 20
-
-batch_size = 6
-epochs     = 500
+batch_size = 1
+epochs     = 5
 lr         = 1e-4
 momentum   = 0
 w_decay    = 1e-5
@@ -32,32 +28,25 @@ gamma      = 0.5
 configs    = "FCNs-BCEWithLogits_batch{}_epoch{}_RMSprop_scheduler-step{}-gamma{}_lr{}_momentum{}_w_decay{}".format(batch_size, epochs, step_size, gamma, lr, momentum, w_decay)
 print("Configs:", configs)
 
-if sys.argv[1] == 'CamVid':
-    root_dir   = "CamVid/"
-else
-    root_dir   = "CityScapes/"
+
+root_dir   = "CamVid/"
+
 train_file = os.path.join(root_dir, "train.csv")
 val_file   = os.path.join(root_dir, "val.csv")
 
 # create dir for model
 model_dir = "models"
-if not os.path.exists(model_dir):
-    os.makedirs(model_dir)
+
+print(configs)
 model_path = os.path.join(model_dir, configs)
 
 use_gpu = torch.cuda.is_available()
 num_gpu = list(range(torch.cuda.device_count()))
 
-if sys.argv[1] == 'CamVid':
-    train_data = CamVidDataset(csv_file=train_file, phase='train')
-else:
-    train_data = CityscapesDataset(csv_file=train_file, phase='train')
+train_data = CamVidDataset(csv_file=train_file, phase='train')
 train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=8)
 
-if sys.argv[1] == 'CamVid':
-    val_data = CamVidDataset(csv_file=val_file, phase='val', flip_rate=0)
-else:
-    val_data = CityscapesDataset(csv_file=val_file, phase='val', flip_rate=0)
+val_data = CamVidDataset(csv_file=val_file, phase='val', flip_rate=0)
 val_loader = DataLoader(val_data, batch_size=1, num_workers=8)
 
 vgg_model = VGGNet(requires_grad=True, remove_fc=True)
@@ -81,7 +70,6 @@ if not os.path.exists(score_dir):
 IU_scores    = np.zeros((epochs, n_class))
 pixel_scores = np.zeros(epochs)
 
-
 def train():
     for epoch in range(epochs):
         scheduler.step()
@@ -97,72 +85,61 @@ def train():
                 inputs, labels = Variable(batch['X']), Variable(batch['Y'])
 
             outputs = fcn_model(inputs)
+            
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
 
-            if iter % 10 == 0:
-                print("epoch{}, iter{}, loss: {}".format(epoch, iter, loss.data[0]))
+            if iter % 100 == 0:
+                print("epoch{}, iter{}, loss: {}".format(epoch, iter, loss.data))
         
         print("Finish epoch {}, time elapsed {}".format(epoch, time.time() - ts))
+        print(model_path)
         torch.save(fcn_model, model_path)
-
+        print("Done")
         val(epoch)
-
 
 def val(epoch):
     fcn_model.eval()
-    total_ious = []
-    pixel_accs = []
+    cm = np.zeros((n_class, n_class), dtype=int)
     for iter, batch in enumerate(val_loader):
         if use_gpu:
             inputs = Variable(batch['X'].cuda())
         else:
             inputs = Variable(batch['X'])
-
+        
         output = fcn_model(inputs)
         output = output.data.cpu().numpy()
-
         N, _, h, w = output.shape
         pred = output.transpose(0, 2, 3, 1).reshape(-1, n_class).argmax(axis=1).reshape(N, h, w)
-
+       
         target = batch['l'].cpu().numpy().reshape(N, h, w)
-        for p, t in zip(pred, target):
-            total_ious.append(iou(p, t))
-            pixel_accs.append(pixel_acc(p, t))
+        cm +=_fast_hist(pred, target, n_class)
+        
 
     # Calculate average IoU
-    total_ious = np.array(total_ious).T  # n_class * val_len
-    ious = np.nanmean(total_ious, axis=1)
-    pixel_accs = np.array(pixel_accs).mean()
-    print("epoch{}, pix_acc: {}, meanIoU: {}, IoUs: {}".format(epoch, pixel_accs, np.nanmean(ious), ious))
-    IU_scores[epoch] = ious
-    np.save(os.path.join(score_dir, "meanIU"), IU_scores)
-    pixel_scores[epoch] = pixel_accs
-    np.save(os.path.join(score_dir, "meanPixel"), pixel_scores)
+    acc, acc_cls, mean_iu, fwavacc = evaluate(cm)
+    print("epoch{}, pix_acc: {}, acc_cls: {}, meanIoU: {}, fwavacc: {}".format(epoch, acc, acc_cls, mean_iu, fwavacc))
+
+    def _fast_hist(label_pred, label_true, num_classes):
+    mask = (label_true >= 0) & (label_true < num_classes)
+    hist = np.bincount(
+        num_classes * label_true[mask].astype(int) +
+        label_pred[mask], minlength=num_classes ** 2).reshape(num_classes, num_classes)
+    return hist
 
 
-# borrow functions and modify it from https://github.com/Kaixhin/FCN-semantic-segmentation/blob/master/main.py
-# Calculates class intersections over unions
-def iou(pred, target):
-    ious = []
-    for cls in range(n_class):
-        pred_inds = pred == cls
-        target_inds = target == cls
-        intersection = pred_inds[target_inds].sum()
-        union = pred_inds.sum() + target_inds.sum() - intersection
-        if union == 0:
-            ious.append(float('nan'))  # if there is no ground truth, do not include in evaluation
-        else:
-            ious.append(float(intersection) / max(union, 1))
-        # print("cls", cls, pred_inds.sum(), target_inds.sum(), intersection, float(intersection) / max(union, 1))
-    return ious
-
-
-def pixel_acc(pred, target):
-    correct = (pred == target).sum()
-    total   = (target == target).sum()
-    return correct / total
+def evaluate(hist):
+    
+    hist = hist[1:,1:]
+    acc = np.diag(hist).sum() / hist.sum()
+    acc_cls = np.diag(hist) / hist.sum(axis=1)
+    acc_cls = np.nanmean(acc_cls)
+    iu = np.diag(hist) / (hist.sum(axis=1) + hist.sum(axis=0) - np.diag(hist))
+    mean_iu = np.nanmean(iu)
+    freq = hist.sum(axis=1) / hist.sum()
+    fwavacc = (freq[freq > 0] * iu[freq > 0]).sum()
+    return acc, acc_cls, mean_iu, fwavacc
 
 
 if __name__ == "__main__":
